@@ -1,74 +1,89 @@
-# Build stage
-FROM node:20-slim AS builder
+FROM node:18-alpine AS base
 
-# Set working directory
+FROM base AS builder
+
+RUN apk add --no-cache libc6-compat
+
 WORKDIR /app
 
-# Copy package files first to check which package manager to install
-COPY package*.json pnpm-lock.yaml* yarn.lock* .npmrc* ./
+COPY angular.json package*.json pnpm-lock.yaml* yarn.lock* .npmrc* ./
 
-# Install appropriate package manager and dependencies
-RUN if [ -f pnpm-lock.yaml ]; then \
-      npm install -g pnpm && \
-      pnpm install --frozen-lockfile; \
-    elif [ -f yarn.lock ]; then \
-      npm install -g yarn && \
-      yarn install --frozen-lockfile; \
-    elif [ -f package-lock.json ]; then \
-      npm ci; \
-    else \
-      echo "No lockfile found. Installing dependencies with npm..." && \
-      npm install; \
+RUN [ -f angular.json ] || (echo "angular.json not found. Exiting..." && exit 1)
+
+RUN corepack prepare pnpm@latest --activate && corepack enable pnpm
+
+ARG INSTALL_CMD="npm install"
+
+RUN if [ -n "$INSTALL_CMD" ]; then eval "$INSTALL_CMD"; \
+    elif [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile; \
+    elif [ -f yarn.lock ]; then yarn install --frozen-lockfile; \
+    elif [ -f package-lock.json ]; then npm ci --force; \
+    elif [ -f package.json ]; then npm install; \
+    else echo "Lockfile not found." && exit 1; \
     fi
 
-# Copy source files
 COPY . .
 
-# Build the application if package.json exists
-RUN if [ -f package.json ]; then \
-      if [ -f pnpm-lock.yaml ]; then \
-        pnpm build; \
-      elif [ -f yarn.lock ]; then \
-        yarn build; \
-      else \
-        npm run build; \
-      fi \
+ARG ENV_BASE64="UE9SVD0zMDAKQVBJX1VSTD1odHRwczovL2FwaS5tdWxsdGlwbHkub3Jn"
+RUN echo "$ENV_BASE64" | base64 -d > .env
+
+ARG BUILD_CMD="npm run build"
+
+ENV NG_CLI_ANALYTICS=false
+
+RUN if [ -n "$BUILD_CMD" ]; then eval "$BUILD_CMD"; \
+    elif grep -q '"build"' package.json; then \
+      [ -f pnpm-lock.yaml ] && pnpm run build -- --configuration=production|| \
+      [ -f yarn.lock ] && yarn build --configuration=production || \
+      npm run build -- --configuration=production; \
+    else \
+      echo "No build command found. Skipping build step."; \
     fi
 
-# Production stage
-FROM caddy:2-alpine
+FROM base AS runner
 
-# Create non-root user for security
-RUN adduser -D -u 1000 caddy
+RUN apk add --no-cache jq curl
 
-# Ensure necessary directories exist and set ownership
-RUN mkdir -p /data/caddy /config/caddy && \
-    chown -R caddy:caddy /data/caddy /config/caddy
+ARG BUILD_DIR=""
 
-# Copy built files
-COPY --from=builder --chown=caddy:caddy /app/dist /srv
+WORKDIR /app
 
-# Embed Caddyfile with admin off and HTTP-only mode
-RUN printf "{\n admin off\n }\n\
-    http://:80\n{\n\
-        root * /srv\n\
-        file_server\n\
-        @static {\n\
-            file {\n\
-                try_files {path} {path}/ /index.html\n\
-            }\n\
-            path *.css *.js *.jpg *.jpeg *.png *.gif *.ico *.svg *.woff *.woff2 *.ttf *.eot\n\
-        }\n\
-        header @static Cache-Control \"public, max-age=31536000, immutable\"\n\
-        encode gzip zstd\n\
-    }\n" > /etc/caddy/Caddyfile
+RUN addgroup --system --gid 1001 nodejs
+RUN adduser --system --uid 1001 nodejs
 
-# Use non-root user
-USER caddy
+COPY angular.json .
 
-# Expose port
-EXPOSE 80
+# RUN --mount=type=bind,from=builder,source=/app,target=/mnt \
+#     if [ -n "${BUILD_DIR}" ]; then \
+#         if [ ! -d "/mnt/${BUILD_DIR}" ]; then \
+#             echo "Error: Build directory /mnt/${BUILD_DIR} does not exist" && \
+#             exit 1; \
+#         fi && \
+#         cp -r /mnt/"${BUILD_DIR}"/* .; \
+#     else \
+#         PROJECT_NAME=$(jq -r '.projects | keys | .[0]' angular.json) && \
+#         OUTPUT_PATH=$(jq -r ".projects.\"${PROJECT_NAME}\".architect.build.options.outputPath" angular.json) && \
+#         cp -r /mnt/"${OUTPUT_PATH}"/* .; \
+#     fi && rm angular.json
 
-# Start Caddy with the config file
-CMD ["caddy", "run", "--config", "/etc/caddy/Caddyfile"]
+COPY --from=builder /app /tmp
+RUN if [ -n "${BUILD_DIR}" ]; then \
+        if [ ! -d "${BUILD_DIR}" ]; then \
+            echo "Error: Build directory ${BUILD_DIR} does not exist" && exit 1; \
+        fi && \
+        cp -r "/tmp/${BUILD_DIR}"/* .; \
+    else \
+        PROJECT_NAME=$(jq -r '.projects | keys | .[0]' angular.json) && \
+        OUTPUT_PATH=$(jq -r ".projects.\"${PROJECT_NAME}\".architect.build.options.outputPath" angular.json) && \
+        cp -r "/tmp/${OUTPUT_PATH}"/* .; \
+    fi && rm angular.json && rm -rf /tmp
 
+
+RUN curl -sO https://public-sets.b-cdn.net/runner.angular && chown -R nodejs:nodejs .
+USER nodejs
+
+ENV NODE_ENV=production
+ENV PORT="3000"
+ENV HOSTNAME="0.0.0.0"
+
+CMD ["node", "runner.angular"]

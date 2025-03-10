@@ -1,0 +1,93 @@
+const cluster = require('cluster');
+const os = require('os');
+const { spawn } = require('child_process');
+const net = require('net');
+
+// Default port (can be overridden via env variable)
+const PORT = process.env.PORT || 3000;
+
+// Flag to track if we're intentionally shutting down workers
+let fallingBackToSingleProcess = false;
+
+// Check if a port is available
+async function isPortAvailable(port) {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    server.once('error', (err) => resolve(err.code !== 'EADDRINUSE'));
+    server.once('listening', () => server.close(() => resolve(true)));
+    server.listen(port);
+  });
+}
+
+// Start server in cluster mode
+async function startClusterMode() {
+  if (cluster.isMaster) {
+    const numWorkers = Math.max(1, Math.ceil(os.cpus().length / 2));
+    console.log(`Master ${process.pid} spawning ${numWorkers} worker(s)`);
+
+    for (let i = 0; i < numWorkers; i++) cluster.fork();
+
+    // Only restart workers if we're not falling back
+    cluster.on('exit', (worker, code) => {
+      if (!fallingBackToSingleProcess) {
+        console.log(`Worker ${worker.process.pid} exited with code ${code}. Restarting...`);
+        cluster.fork();
+      }
+    });
+
+    setTimeout(async () => {
+      if (await isPortAvailable(PORT)) {
+        console.log(`Port ${PORT} is still free, falling back to single process.`);
+        
+        // Set flag before killing workers
+        fallingBackToSingleProcess = true;
+        
+        // Kill all workers
+        for (const id in cluster.workers) {
+          cluster.workers[id].kill();
+        }
+        
+        // Give workers time to shut down before starting child process
+        setTimeout(() => {
+          spawnChildProcess();
+        }, 1000);
+      } else {
+        console.log(`Cluster mode is active on port ${PORT}.`);
+      }
+    }, 3000);
+  } else {
+    runWorkerServer();
+  }
+}
+
+// Fallback: Run the server in a child process
+function spawnChildProcess() {
+  console.log('Running server in fallback mode...');
+  const child = spawn('node', ['./server/server.mjs'], { stdio: 'inherit' });
+
+  child.on('exit', (code) => {
+    console.error(`Child process exited with code ${code}`);
+    process.exit(code);
+  });
+}
+
+// Worker function to run server
+async function runWorkerServer() {
+  try {
+    await import('./server/server.mjs');
+    console.log(`Worker ${process.pid} running`);
+  } catch (error) {
+    console.error(`Worker ${process.pid} failed:`, error);
+    process.exit(1);
+  }
+}
+
+// Initialize server
+(async () => {
+  try {
+    await startClusterMode();
+  } catch (error) {
+    console.error('Cluster mode failed:', error);
+    spawnChildProcess();
+  }
+})();
