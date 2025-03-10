@@ -32,12 +32,9 @@ ARG BUILD_CMD="npm run build"
 ENV NG_CLI_ANALYTICS=false
 
 RUN if [ -n "$BUILD_CMD" ]; then eval "$BUILD_CMD"; \
-    elif grep -q '"build"' package.json; then \
-      [ -f pnpm-lock.yaml ] && pnpm run build -- --configuration=production|| \
-      [ -f yarn.lock ] && yarn build --configuration=production || \
-      npm run build -- --configuration=production; \
-    else \
-      echo "No build command found. Skipping build step."; \
+    elif [ -f pnpm-lock.yaml ]; then pnpm run build --configuration=production; \
+    elif [ -f yarn.lock ]; then yarn build --configuration=production; \
+    else npm run build -- --configuration=production; \
     fi
 
 FROM base AS runner
@@ -86,4 +83,4 @@ ENV NODE_ENV=production
 ENV PORT="3000"
 ENV HOSTNAME="0.0.0.0"
 
-CMD ["node", "runner.angular"]
+CMD ["node", "./server/server.mjs"]
