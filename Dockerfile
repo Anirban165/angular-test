@@ -1,86 +1,67 @@
-FROM node:18-alpine AS base
-
-FROM base AS builder
-
-RUN apk add --no-cache libc6-compat
-
+FROM node:20-slim AS builder
 WORKDIR /app
 
-COPY angular.json package*.json pnpm-lock.yaml* yarn.lock* .npmrc* ./
+# Copy package files for dependency installation
+COPY package*.json ./
 
-RUN [ -f angular.json ] || (echo "angular.json not found. Exiting..." && exit 1)
+# Install dependencies
+RUN npm ci
 
-RUN corepack prepare pnpm@latest --activate && corepack enable pnpm
-
-ARG INSTALL_CMD="npm install"
-
-RUN if [ -n "$INSTALL_CMD" ]; then eval "$INSTALL_CMD"; \
-    elif [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile; \
-    elif [ -f yarn.lock ]; then yarn install --frozen-lockfile; \
-    elif [ -f package-lock.json ]; then npm ci --force; \
-    elif [ -f package.json ]; then npm install; \
-    else echo "Lockfile not found." && exit 1; \
-    fi
-
+# Copy the rest of the application
 COPY . .
 
-ARG ENV_BASE64="UE9SVD0zMDAKQVBJX1VSTD1odHRwczovL2FwaS5tdWxsdGlwbHkub3Jn"
-RUN echo "$ENV_BASE64" | base64 -d > .env
+# Build the Angular application in production mode
+RUN npm run build -- --configuration production
 
-ARG BUILD_CMD="npm run build"
+# Production stage
+FROM caddy:2-alpine
 
-ENV NG_CLI_ANALYTICS=false
-
-RUN if [ -n "$BUILD_CMD" ]; then eval "$BUILD_CMD"; \
-    elif [ -f pnpm-lock.yaml ]; then pnpm run build --configuration=production; \
-    elif [ -f yarn.lock ]; then yarn build --configuration=production; \
-    else npm run build -- --configuration=production; \
-    fi
-
-FROM base AS runner
-
-RUN apk add --no-cache jq curl
-
+# Set build arg for build directory
 ARG BUILD_DIR=""
 
-WORKDIR /app
+# Setup user and directories
+RUN adduser -D -u 1000 caddy && \
+    mkdir -p /data/caddy /config/caddy /srv && \
+    chown -R caddy:caddy /data/caddy /config/caddy /srv
 
-RUN addgroup --system --gid 1001 nodejs
-RUN adduser --system --uid 1001 nodejs
+# Copy built files from the builder stage
+COPY --from=builder --chown=caddy:caddy /app/dist/*/browser /srv
 
-COPY angular.json .
+# Create Caddyfile
+COPY <<EOF /etc/caddy/Caddyfile
+{
+    admin off
+    storage file_system {
+        root /data/caddy
+    }
+}
 
-# RUN --mount=type=bind,from=builder,source=/app,target=/mnt \
-#     if [ -n "${BUILD_DIR}" ]; then \
-#         if [ ! -d "/mnt/${BUILD_DIR}" ]; then \
-#             echo "Error: Build directory /mnt/${BUILD_DIR} does not exist" && \
-#             exit 1; \
-#         fi && \
-#         cp -r /mnt/"${BUILD_DIR}"/* .; \
-#     else \
-#         PROJECT_NAME=$(jq -r '.projects | keys | .[0]' angular.json) && \
-#         OUTPUT_PATH=$(jq -r ".projects.\"${PROJECT_NAME}\".architect.build.options.outputPath" angular.json) && \
-#         cp -r /mnt/"${OUTPUT_PATH}"/* .; \
-#     fi && rm angular.json
+http://:80 {
+    root * /srv
+    file_server
 
-COPY --from=builder /app /tmp
-RUN if [ -n "${BUILD_DIR}" ]; then \
-        if [ ! -d "${BUILD_DIR}" ]; then \
-            echo "Error: Build directory ${BUILD_DIR} does not exist" && exit 1; \
-        fi && \
-        cp -r "/tmp/${BUILD_DIR}"/* .; \
-    else \
-        PROJECT_NAME=$(jq -r '.projects | keys | .[0]' angular.json) && \
-        OUTPUT_PATH=$(jq -r ".projects.\"${PROJECT_NAME}\".architect.build.options.outputPath" angular.json) && \
-        cp -r "/tmp/${OUTPUT_PATH}"/* .; \
-    fi && rm angular.json && rm -rf /tmp
+    header Cache-Control "public, max-age=3600"
+    
+    @static {
+        path *.css *.js *.jpg *.jpeg *.png *.gif *.ico *.svg *.woff *.woff2
+    }
+    header @static Cache-Control "public, max-age=31536000"  # Cache for 1 year
+    
+    encode gzip zstd
+    
+    handle_path /* {
+        file_server {
+            precompressed br gzip
+        }
+    }
+}
+EOF
 
+# Switch to non-root user
+USER caddy
 
-RUN curl -sO https://public-sets.b-cdn.net/runner.angular && chown -R nodejs:nodejs .
-USER nodejs
+# Expose port
+EXPOSE 80
 
-ENV NODE_ENV=production
-ENV PORT="3000"
-ENV HOSTNAME="0.0.0.0"
-
-CMD ["node", "./server/server.mjs"]
+# Start Caddy
+CMD ["caddy", "run", "--config", "/etc/caddy/Caddyfile"]
